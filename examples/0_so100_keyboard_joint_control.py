@@ -3,11 +3,15 @@
 Simplified keyboard control for SO100/SO101 robot
 Fixed action format conversion issues
 Uses P control, keyboard only changes target joint angles
+Now uses `evdev` for Linux direct keyboard event reading
 """
 
 import time
 import logging
 import traceback
+import select
+import evdev
+from evdev import ecodes
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -20,20 +24,13 @@ JOINT_CALIBRATION = [
     ['shoulder_lift', 2.0, 0.97],     # Joint2: zero position offset, scale factor
     ['elbow_flex', 0.0, 1.05],        # Joint3: zero position offset, scale factor
     ['wrist_flex', 0.0, 0.94],        # Joint4: zero position offset, scale factor
-    ['wrist_roll', 0.0, 0.5],        # Joint5: zero position offset, scale factor
-    ['gripper', 0.0, 1.0],           # Joint6: zero position offset, scale factor
+    ['wrist_roll', 0.0, 0.5],         # Joint5: zero position offset, scale factor
+    ['gripper', 0.0, 1.0],            # Joint6: zero position offset, scale factor
 ]
 
 def apply_joint_calibration(joint_name, raw_position):
     """
     Apply joint calibration coefficients
-    
-    Args:
-        joint_name: Joint name
-        raw_position: Raw position value
-    
-    Returns:
-        calibrated_position: Calibrated position value
     """
     for joint_cal in JOINT_CALIBRATION:
         if joint_cal[0] == joint_name:
@@ -47,24 +44,19 @@ def apply_joint_calibration(joint_name, raw_position):
 def move_to_zero_position(robot, duration=3.0, kp=0.5):
     """
     Use P control to slowly move robot to zero position
-    
-    Args:
-        robot: Robot instance
-        duration: Time required to move to zero position (seconds)
-        kp: Proportional gain
     """
     print("Using P control to slowly move robot to zero position...")
-    
+
     # Get current robot state
     current_obs = robot.get_observation()
-    
+
     # Extract current joint positions
     current_positions = {}
     for key, value in current_obs.items():
         if key.endswith('.pos'):
             motor_name = key.removesuffix('.pos')
             current_positions[motor_name] = value
-    
+
     # Zero position targets
     zero_positions = {
         'shoulder_pan': 0.0,
@@ -74,14 +66,14 @@ def move_to_zero_position(robot, duration=3.0, kp=0.5):
         'wrist_roll': 0.0,
         'gripper': 0.0
     }
-    
+
     # Calculate control steps
     control_freq = 50  # 50Hz control frequency
     total_steps = int(duration * control_freq)
     step_time = 1.0 / control_freq
-    
+
     print(f"Will move to zero position in {duration} seconds using P control, control frequency: {control_freq}Hz, proportional gain: {kp}")
-    
+
     for step in range(total_steps):
         # Get current robot state
         current_obs = robot.get_observation()
@@ -92,49 +84,43 @@ def move_to_zero_position(robot, duration=3.0, kp=0.5):
                 # Apply calibration coefficients
                 calibrated_value = apply_joint_calibration(motor_name, value)
                 current_positions[motor_name] = calibrated_value
-        
+
         # P control calculation
         robot_action = {}
         for joint_name, target_pos in zero_positions.items():
             if joint_name in current_positions:
                 current_pos = current_positions[joint_name]
                 error = target_pos - current_pos
-                
+
                 # P control: output = Kp * error
                 control_output = kp * error
-                
+
                 # Convert control output to position command
                 new_position = current_pos + control_output
                 robot_action[f"{joint_name}.pos"] = new_position
-        
+
         # Send action to robot
         if robot_action:
             robot.send_action(robot_action)
-        
+
         # Display progress
         if step % (control_freq // 2) == 0:  # Display progress every 0.5 seconds
             progress = (step / total_steps) * 100
             print(f"Moving to zero position progress: {progress:.1f}%")
-        
+
         time.sleep(step_time)
-    
+
     print("Robot has moved to zero position")
 
 def return_to_start_position(robot, start_positions, kp=0.5, control_freq=50):
     """
     Use P control to return to start position
-    
-    Args:
-        robot: Robot instance
-        start_positions: Start joint positions dictionary
-        kp: Proportional gain
-        control_freq: Control frequency (Hz)
     """
     print("Returning to start position...")
-    
+
     control_period = 1.0 / control_freq
     max_steps = int(5.0 * control_freq)  # Maximum 5 seconds
-    
+
     for step in range(max_steps):
         # Get current robot state
         current_obs = robot.get_observation()
@@ -143,7 +129,7 @@ def return_to_start_position(robot, start_positions, kp=0.5, control_freq=50):
             if key.endswith('.pos'):
                 motor_name = key.removesuffix('.pos')
                 current_positions[motor_name] = value  # Don't apply calibration coefficients
-        
+
         # P control calculation
         robot_action = {}
         total_error = 0
@@ -152,95 +138,97 @@ def return_to_start_position(robot, start_positions, kp=0.5, control_freq=50):
                 current_pos = current_positions[joint_name]
                 error = target_pos - current_pos
                 total_error += abs(error)
-                
+
                 # P control: output = Kp * error
                 control_output = kp * error
-                
+
                 # Convert control output to position command
                 new_position = current_pos + control_output
                 robot_action[f"{joint_name}.pos"] = new_position
-        
+
         # Send action to robot
         if robot_action:
             robot.send_action(robot_action)
-        
+
         # Check if start position is reached
         if total_error < 2.0:  # If total error is less than 2 degrees, consider reached
             print("Returned to start position")
             break
-        
+
         time.sleep(control_period)
-    
+
     print("Return to start position completed")
 
-def p_control_loop(robot, keyboard, target_positions, start_positions, kp=0.5, control_freq=50):
+def p_control_loop(robot, keyboard_dev, target_positions, start_positions, kp=0.5, control_freq=50):
     """
-    P control loop
-    
-    Args:
-        robot: Robot instance
-        keyboard: Keyboard instance
-        target_positions: Target joint positions dictionary
-        start_positions: Start joint positions dictionary
-        kp: Proportional gain
-        control_freq: Control frequency (Hz)
+    P control loop using evdev
     """
     control_period = 1.0 / control_freq
-    
+
     print(f"Starting P control loop, control frequency: {control_freq}Hz, proportional gain: {kp}")
-    
+
+    # Store currently held down keys
+    active_keys = set()
+
+    # Evdev Key mapping
+    joint_controls = {
+        ecodes.KEY_Q: ('shoulder_pan', -1),     # Joint1 decrease
+        ecodes.KEY_A: ('shoulder_pan', 1),      # Joint1 increase
+        ecodes.KEY_W: ('shoulder_lift', -1),    # Joint2 decrease
+        ecodes.KEY_S: ('shoulder_lift', 1),     # Joint2 increase
+        ecodes.KEY_E: ('elbow_flex', -1),       # Joint3 decrease
+        ecodes.KEY_D: ('elbow_flex', 1),        # Joint3 increase
+        ecodes.KEY_R: ('wrist_flex', -1),       # Joint4 decrease
+        ecodes.KEY_F: ('wrist_flex', 1),        # Joint4 increase
+        ecodes.KEY_T: ('wrist_roll', -1),       # Joint5 decrease
+        ecodes.KEY_G: ('wrist_roll', 1),        # Joint5 increase
+        ecodes.KEY_Y: ('gripper', -1),          # Joint6 decrease
+        ecodes.KEY_H: ('gripper', 1),           # Joint6 increase
+    }
+
     while True:
         try:
-            # Get keyboard input
-            keyboard_action = keyboard.get_action()
-            
-            if keyboard_action:
-                # Process keyboard input, update target positions
-                for key, value in keyboard_action.items():
-                    if key == 'x':
-                        # Exit program, first return to start position
-                        print("Exit command detected, returning to start position...")
-                        return_to_start_position(robot, start_positions, 0.2, control_freq)
-                        return
-                    
-                    # Joint control mapping
-                    joint_controls = {
-                        'q': ('shoulder_pan', -1),    # Joint1 decrease
-                        'a': ('shoulder_pan', 1),     # Joint1 increase
-                        'w': ('shoulder_lift', -1),   # Joint2 decrease
-                        's': ('shoulder_lift', 1),    # Joint2 increase
-                        'e': ('elbow_flex', -1),      # Joint3 decrease
-                        'd': ('elbow_flex', 1),       # Joint3 increase
-                        'r': ('wrist_flex', -1),      # Joint4 decrease
-                        'f': ('wrist_flex', 1),       # Joint4 increase
-                        't': ('wrist_roll', -1),      # Joint5 decrease
-                        'g': ('wrist_roll', 1),       # Joint5 increase
-                        'y': ('gripper', -1),         # Joint6 decrease
-                        'h': ('gripper', 1),          # Joint6 increase
-                    }
-                    
-                    if key in joint_controls:
-                        joint_name, delta = joint_controls[key]
+            # Non-blocking read of keyboard events
+            r, w, x = select.select([keyboard_dev.fd], [], [], 0.0)
+            if r:
+                for event in keyboard_dev.read():
+                    if event.type == ecodes.EV_KEY:
+                        if event.value == 1:  # Key down
+                            active_keys.add(event.code)
+                        elif event.value == 0:  # Key up
+                            active_keys.discard(event.code)
+
+            # Process active keyboard inputs
+            if active_keys:
+                if ecodes.KEY_X in active_keys or ecodes.KEY_ESC in active_keys:
+                    print("Exit command detected, returning to start position...")
+                    return_to_start_position(robot, start_positions, 0.2, control_freq)
+                    return
+
+                for key_code in active_keys:
+                    if key_code in joint_controls:
+                        joint_name, delta = joint_controls[key_code]
                         if joint_name in target_positions:
                             current_target = target_positions[joint_name]
-                             
-                            if joint_name == 'gripper': 
-                                step = delta * 5.0 
+
+                            if joint_name == 'gripper':
+                                step = delta * 5.0
                                 new_target = current_target + step
                                 new_target = max(0.0, min(100.0, new_target))
-                                
-                                print(f"Updated Gripper: {current_target:.1f}% -> {new_target:.1f}%")
-                            
-                            else: 
+
+                                # Prevent log spam if at max/min
+                                if current_target != new_target:
+                                    print(f"Updated Gripper: {current_target:.1f}% -> {new_target:.1f}%")
+
+                            else:
                                 new_target = int(current_target + delta)
                                 print(f"Updated joint {joint_name}: {current_target} -> {new_target}°")
-                            
+
                             target_positions[joint_name] = new_target
-                            print(f"Updated target position {joint_name}: {current_target} -> {new_target}")
-            
+
             # Get current robot state
             current_obs = robot.get_observation()
-            
+
             # Extract current joint positions
             current_positions = {}
             for key, value in current_obs.items():
@@ -249,27 +237,27 @@ def p_control_loop(robot, keyboard, target_positions, start_positions, kp=0.5, c
                     # Apply calibration coefficients
                     calibrated_value = apply_joint_calibration(motor_name, value)
                     current_positions[motor_name] = calibrated_value
-            
+
             # P control calculation
             robot_action = {}
             for joint_name, target_pos in target_positions.items():
                 if joint_name in current_positions:
                     current_pos = current_positions[joint_name]
                     error = target_pos - current_pos
-                    
+
                     # P control: output = Kp * error
                     control_output = kp * error
-                    
+
                     # Convert control output to position command
                     new_position = current_pos + control_output
                     robot_action[f"{joint_name}.pos"] = new_position
-            
+
             # Send action to robot
             if robot_action:
                 robot.send_action(robot_action)
-            
+
             time.sleep(control_period)
-            
+
         except KeyboardInterrupt:
             print("User interrupted program")
             break
@@ -278,46 +266,66 @@ def p_control_loop(robot, keyboard, target_positions, start_positions, kp=0.5, c
             traceback.print_exc()
             break
 
+def get_evdev_keyboard():
+    """Finds available evdev keyboard devices and prompts user to select one"""
+    devices = [evdev.InputDevice(path) for path in evdev.list_devices()]
+
+    # Filter for devices that have keyboard keys
+    keyboards = []
+    for d in devices:
+        if ecodes.EV_KEY in d.capabilities():
+            keyboards.append(d)
+
+    if not keyboards:
+        print("No keyboard input devices found! (Are you running with sudo?)")
+        return None
+
+    print("\nAvailable Keyboard Devices:")
+    for i, dev in enumerate(keyboards):
+        print(f"[{i}] {dev.path} - {dev.name}")
+
+    choice = input(f"\nSelect keyboard device index [0-{len(keyboards)-1}] (default 0): ").strip()
+    try:
+        idx = int(choice) if choice else 0
+        selected_dev = keyboards[idx]
+        print(f"Selected: {selected_dev.name}\n")
+        return selected_dev
+    except (ValueError, IndexError):
+        print("Invalid selection. Using default [0].")
+        return keyboards[0]
+
 def main():
     """Main function"""
-    print("LeRobot Simplified Keyboard Control Example (P Control)")
+    print("LeRobot Simplified Keyboard Control Example (P Control + Evdev)")
     print("="*50)
-    
+
     try:
-
-        # from lerobot.robots.so100_follower import SO100Follower, SO100FollowerConfig
-        # from lerobot.teleoperators.keyboard import KeyboardTeleop, KeyboardTeleopConfig
-
         from lerobot.robots.so_follower.so_follower import SO100Follower
         from lerobot.robots.so_follower.config_so_follower import SO100FollowerConfig
-        
-        from lerobot.teleoperators.keyboard.teleop_keyboard import KeyboardTeleop
-        from lerobot.teleoperators.keyboard.configuration_keyboard import KeyboardTeleopConfig
-                
+
         # Get port
         port = input("Please enter SO100 robot USB port (e.g.: /dev/ttyACM0): ").strip()
-        
+
         # If directly press enter, use default port
         if not port:
             port = "/dev/ttyACM0"
             print(f"Using default port: {port}")
         else:
             print(f"Connecting to port: {port}")
-        
+
         # Configure robot
         robot_config = SO100FollowerConfig(port=port)
         robot = SO100Follower(robot_config)
-        
-        # Configure keyboard
-        keyboard_config = KeyboardTeleopConfig()
-        keyboard = KeyboardTeleop(keyboard_config)
-        
+
+        # Configure evdev keyboard
+        keyboard_dev = get_evdev_keyboard()
+        if not keyboard_dev:
+            return
+
         # Connect devices
         robot.connect()
-        keyboard.connect()
-        
-        print("Devices connected successfully!")
-        
+        print("Robot connected successfully!")
+
         # Ask whether to recalibrate
         while True:
             calibrate_choice = input("Do you want to recalibrate the robot? (y/n): ").strip().lower()
@@ -331,7 +339,7 @@ def main():
                 break
             else:
                 print("Please enter y or n")
-        
+
         # Read starting joint angles
         print("Reading starting joint angles...")
         start_obs = robot.get_observation()
@@ -340,14 +348,14 @@ def main():
             if key.endswith('.pos'):
                 motor_name = key.removesuffix('.pos')
                 start_positions[motor_name] = int(value)  # Don't apply calibration coefficients
-        
+
         print("Starting joint angles:")
         for joint_name, position in start_positions.items():
             print(f"  {joint_name}: {position}°")
-        
+
         # Move to zero position
         move_to_zero_position(robot, duration=3.0)
-        
+
         # Initialize target positions to current positions (integers)
         target_positions = {
         'shoulder_pan': 0.0,
@@ -357,8 +365,7 @@ def main():
         'wrist_roll': 0.0,
         'gripper': 0.0
           }
-        
-        
+
         print("Keyboard control instructions:")
         print("- Q/A: Joint1 (shoulder_pan) decrease/increase")
         print("- W/S: Joint2 (shoulder_lift) decrease/increase")
@@ -366,19 +373,17 @@ def main():
         print("- R/F: Joint4 (wrist_flex) decrease/increase")
         print("- T/G: Joint5 (wrist_roll) decrease/increase")
         print("- Y/H: Joint6 (gripper) decrease/increase")
-        print("- X: Exit program (first return to start position)")
-        print("- ESC: Exit program")
+        print("- X/ESC: Exit program (first return to start position)")
         print("="*50)
         print("Note: Robot will continuously move to target position")
-        
+
         # Start P control loop
-        p_control_loop(robot, keyboard, target_positions, start_positions, kp=0.5, control_freq=50)
-        
+        p_control_loop(robot, keyboard_dev, target_positions, start_positions, kp=0.5, control_freq=50)
+
         # Disconnect
         robot.disconnect()
-        keyboard.disconnect()
         print("Program ended")
-        
+
     except Exception as e:
         print(f"Program execution failed: {e}")
         traceback.print_exc()
@@ -389,4 +394,4 @@ def main():
         print("4. Is the robot correctly configured")
 
 if __name__ == "__main__":
-    main() 
+    main()
