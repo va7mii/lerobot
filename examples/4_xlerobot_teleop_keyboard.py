@@ -1,6 +1,6 @@
 # To Run on the host
 '''python
-PYTHONPATH=src python -m lerobot.robots.xlerobot.xlerobot_host --robot.id=my_xlerobot
+PYTHONPATH=src python -m lerobot.robots.xlerobot_mecanum.xlerobot_host --robot.id=my_xlerobot
 '''
 
 # To Run the teleop:
@@ -12,7 +12,7 @@ import time
 import numpy as np
 import math
 
-from lerobot.robots.xlerobot import XLerobotConfig, XLerobot
+from lerobot.robots.xlerobot_mecanum import XLerobotConfig, XLerobot
 # from lerobot.robots.xlerobot import XLerobotClient, XLerobotClientConfig
 # from lerobot.utils.robot_utils import busy_wait
 from lerobot.utils.robot_utils import precise_sleep
